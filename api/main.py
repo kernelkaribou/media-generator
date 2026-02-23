@@ -370,14 +370,20 @@ async def list_movies(
     genre: Optional[str] = Query(None, description="Filter by genre"),
     sort_by: SortBy = Query(SortBy.movie_id, description="Field to sort by"),
     order: SortOrder = Query(SortOrder.desc, description="Sort direction"),
+    start_id: Optional[int] = Query(None, ge=1, description="Return movies starting at this movie_id"),
     db: Session = Depends(get_db)
 ):
     """
     List all movies from the database.
     
-    Supports pagination, filtering by genre, and sorting.
+    Supports pagination, filtering by genre, sorting, and cursor-based
+    pagination via start_id (filters to movie_id >= start_id regardless
+    of sort order).
     """
     query = db.query(MovieModel)
+    
+    if start_id is not None:
+        query = query.filter(MovieModel.movie_id >= start_id)
     
     if genre:
         query = query.join(GenreModel).filter(GenreModel.genre.ilike(f"%{genre}%"))
