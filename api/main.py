@@ -785,9 +785,18 @@ async def backfill_poster_queue(
     """
     Scan for movies missing posters and add them to the queue.
 
-    Finds movies where poster_url is NULL or the placeholder value
-    and adds them to the poster queue if not already present.
+    First removes failed queue items older than 5 minutes so their movies
+    can be re-enqueued. Then finds movies where poster_url is NULL or the
+    placeholder value and adds them to the poster queue if not already present.
     """
+    from datetime import datetime, timedelta
+
+    failed_cutoff = datetime.utcnow() - timedelta(minutes=5)
+    removed = db.query(PosterQueueModel).filter(
+        PosterQueueModel.status == "failed",
+        PosterQueueModel.claimed_at < failed_cutoff,
+    ).delete()
+
     movies = db.query(MovieModel.movie_id).filter(
         (MovieModel.poster_url.is_(None)) | (MovieModel.poster_url == "movie_poster_url.jpeg")
     ).all()
@@ -803,8 +812,9 @@ async def backfill_poster_queue(
         # Concurrent backfill created duplicates; roll back and count what actually got added
         db.rollback()
         added = 0
+        removed = 0
 
-    return {"added": added, "already_queued": len(movies) - added}
+    return {"added": added, "already_queued": len(movies) - added, "removed_failed": removed}
 
 
 @app.post("/poster-queue/pop", response_model=Optional[PosterQueueResponse], tags=["Poster Queue"])
