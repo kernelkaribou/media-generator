@@ -257,6 +257,7 @@ def build_image_prompt(movie, templates_base, verbose=False):
         prompts_json = json.load(f)
 
     system_prompt = random.choice(prompts_json["image_prompt_system"])
+    log(f"  System prompt style: {system_prompt[:100]}...")
     # This prompt is always static
     prompt_template = prompts_json["image_prompt"][0]
 
@@ -296,6 +297,7 @@ def build_image_prompt(movie, templates_base, verbose=False):
     text_model.system_prompt = system_prompt
 
     completion = text_model.generateResponse()
+    log(f"  AI response length: {len(completion)} chars")
 
     # Extract the image_prompt from the JSON response
     start = completion.find("{")
@@ -429,9 +431,7 @@ def generate_prompt_for_item(queue_item, templates_base, verbose=False):
             log(traceback.format_exc(), "verbose")
         return None
 
-    if verbose:
-        log(f"  Image prompt: {image_prompt}", "verbose")
-
+    log(f"  Prompt: {image_prompt[:200]}{'...' if len(image_prompt) > 200 else ''}")
     log(f"  Prompt generated for '{title}'", "success")
     return image_prompt
 
@@ -443,6 +443,7 @@ def generate_image_for_item(prompt_item, api_url, invokeai_url, api_key, graph, 
     title = prompt_item["title"]
     image_prompt = prompt_item["image_prompt"]
     log(f"Processing image for movie {movie_id}: '{title}' (queue item {queue_id})")
+    log(f"  Prompt: {image_prompt[:200]}{'...' if len(image_prompt) > 200 else ''}")
 
     # Step 1: Enqueue generation in InvokeAI
     log(f"  Enqueuing image generation in InvokeAI...")
@@ -528,6 +529,7 @@ def run_prompts_phase(args, api_key, templates_base):
 
     prompt_items = []
     fail_count = 0
+    item_num = 0
 
     # Pop items and generate prompts
     while True:
@@ -541,6 +543,8 @@ def run_prompts_phase(args, api_key, templates_base):
             log("Queue empty, no more items to process.")
             break
 
+        item_num += 1
+        log(f"--- Item {item_num} ---")
         image_prompt = generate_prompt_for_item(queue_item, templates_base, args.verbose)
         if image_prompt is not None:
             prompt_items.append({
@@ -549,6 +553,7 @@ def run_prompts_phase(args, api_key, templates_base):
                 "title": queue_item["movie"]["title"],
                 "image_prompt": image_prompt,
             })
+            log(f"Progress: {len(prompt_items)} prompts generated, {fail_count} failed")
         else:
             queue_id = queue_item["queue_id"]
             try:
@@ -606,9 +611,11 @@ def run_images_phase(args, api_key):
 
     success_count = 0
     fail_count = 0
+    total = len(prompt_items)
 
-    for prompt_item in prompt_items:
+    for i, prompt_item in enumerate(prompt_items, 1):
         queue_id = prompt_item["queue_id"]
+        log(f"--- Image {i} of {total} ---")
         try:
             if generate_image_for_item(
                 prompt_item, args.media_api, args.invokeai, api_key,
@@ -626,6 +633,7 @@ def run_images_phase(args, api_key):
             except Exception:
                 pass
             fail_count += 1
+        log(f"Progress: {success_count}/{total} succeeded, {fail_count} failed")
         print()
 
     # Clean up prompts file after successful processing
