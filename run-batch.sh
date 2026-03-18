@@ -49,6 +49,9 @@ echo "  Batch Poster Generation Orchestrator"
 echo "============================================"
 echo ""
 
+# Local cbattlegear use
+docker compose -f ~/local_ai_chat/docker-compose.yml down
+
 # ── Phase 1: Generate image prompts with vLLM ──────────────────────────
 if [ "$RUN_PROMPTS" = true ]; then
     echo "=== Phase 1: Generating image prompts (vLLM) ==="
@@ -100,6 +103,8 @@ fi
 # ── Cleanup ─────────────────────────────────────────────────────────────
 echo "=== Cleaning up ==="
 ${COMPOSE} down
+
+docker compose -f ~/local_ai_chat/docker-compose.yml up -d
 
 echo ""
 echo "============================================"
