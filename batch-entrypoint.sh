@@ -1,29 +1,55 @@
 #!/bin/bash
 # Batch poster generation entrypoint
 #
-# 1. Ensures required models are installed in InvokeAI
-# 2. Runs the batch poster generation script
-# 3. Exits (compose will then stop InvokeAI via depends_on)
+# Supports two modes via BATCH_PHASE environment variable:
+#   BATCH_PHASE=prompts  - Generate image prompts using AI text model
+#   BATCH_PHASE=images   - Generate images using InvokeAI
+#   BATCH_PHASE=all      - Both phases in one pass (original behavior, requires both services)
 
 set -e
 
-echo "=== Batch Poster Generation ==="
+PHASE="${BATCH_PHASE:-all}"
+echo "=== Batch Poster Generation (phase: ${PHASE}) ==="
 
-# Step 1: Init models
-./batch-init-models.sh
-if [ $? -ne 0 ]; then
-    echo "[ERROR] Model initialization failed"
-    exit 1
+if [ "$PHASE" = "prompts" ]; then
+    # Prompts-only phase: no InvokeAI needed, just the text model
+    python batch_poster_generate.py \
+        --phase prompts \
+        --media-api "${MEDIA_API_URL:-http://localhost:8000}" \
+        --prompts-file "${PROMPTS_FILE:-/data/batch-prompts.json}" \
+        --api-key "${API_KEY}" \
+        ${VERBOSE:+--verbose}
+elif [ "$PHASE" = "images" ]; then
+    # Images-only phase: needs InvokeAI, reads prompts from file
+    ./batch-init-models.sh
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] Model initialization failed"
+        exit 1
+    fi
+
+    python batch_poster_generate.py \
+        --phase images \
+        --media-api "${MEDIA_API_URL:-http://localhost:8000}" \
+        --invokeai "${INVOKEAI_URL:-http://invokeai:9090}" \
+        --prompts-file "${PROMPTS_FILE:-/data/batch-prompts.json}" \
+        --api-key "${API_KEY}" \
+        ${VERBOSE:+--verbose}
+else
+    # Combined phase (original behavior)
+    ./batch-init-models.sh
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] Model initialization failed"
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Starting poster generation ==="
+    python batch_poster_generate.py \
+        --media-api "${MEDIA_API_URL:-http://localhost:8000}" \
+        --invokeai "${INVOKEAI_URL:-http://invokeai:9090}" \
+        --api-key "${API_KEY}" \
+        ${VERBOSE:+--verbose}
 fi
-
-# Step 2: Run the batch poster generator
-echo ""
-echo "=== Starting poster generation ==="
-python batch_poster_generate.py \
-    --media-api "${MEDIA_API_URL:-http://localhost:8000}" \
-    --invokeai "${INVOKEAI_URL:-http://invokeai:9090}" \
-    --api-key "${API_KEY}" \
-    ${VERBOSE:+--verbose}
 
 exit_code=$?
 

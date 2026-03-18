@@ -37,6 +37,7 @@ from lib.process_helper import processHelper
 # Defaults
 DEFAULT_MEDIA_API_URL = "http://localhost:8000"
 DEFAULT_INVOKEAI_URL = "http://localhost:9090"
+DEFAULT_PROMPTS_FILE = "/data/batch-prompts.json"
 POLL_INTERVAL = 5
 GENERATION_TIMEOUT = 300
 
@@ -412,28 +413,38 @@ def upload_poster(api_url, movie_id, image_data, api_key, thumbnail_data=None):
     return resp.json()
 
 
-def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_key, graph, seed_id, prompt_id, verbose=False):
-    """Generate and upload a poster for a queue item."""
-    queue_id = queue_item["queue_id"]
+def generate_prompt_for_item(queue_item, templates_base, verbose=False):
+    """Generate an image prompt for a queue item. Returns the prompt string or None."""
     movie = queue_item["movie"]
     movie_id = movie["movie_id"]
     title = movie["title"]
-    log(f"Processing movie {movie_id}: '{title}' (queue item {queue_id})")
+    queue_id = queue_item["queue_id"]
+    log(f"Generating prompt for movie {movie_id}: '{title}' (queue item {queue_id})")
 
-    # Step 1: Build the image prompt using the AI text model
-    log(f"  Generating image prompt for '{title}'...")
     try:
         image_prompt = build_image_prompt(movie, templates_base, verbose)
     except Exception as e:
         log(f"  Failed to generate image prompt: {e}", "error")
         if verbose:
             log(traceback.format_exc(), "verbose")
-        return False
+        return None
 
     if verbose:
         log(f"  Image prompt: {image_prompt}", "verbose")
 
-    # Step 2: Enqueue generation in InvokeAI
+    log(f"  Prompt generated for '{title}'", "success")
+    return image_prompt
+
+
+def generate_image_for_item(prompt_item, api_url, invokeai_url, api_key, graph, seed_id, prompt_id):
+    """Generate an image from a pre-built prompt, upload it, and return success."""
+    queue_id = prompt_item["queue_id"]
+    movie_id = prompt_item["movie_id"]
+    title = prompt_item["title"]
+    image_prompt = prompt_item["image_prompt"]
+    log(f"Processing image for movie {movie_id}: '{title}' (queue item {queue_id})")
+
+    # Step 1: Enqueue generation in InvokeAI
     log(f"  Enqueuing image generation in InvokeAI...")
     try:
         enqueue_result = enqueue_generation(invokeai_url, graph, seed_id, prompt_id, image_prompt)
@@ -446,7 +457,7 @@ def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_ke
         log(f"  Failed to enqueue generation: {e}", "error")
         return False
 
-    # Step 3: Wait for generation to complete
+    # Step 2: Wait for generation to complete
     log(f"  Waiting for image generation...")
     result = wait_for_batch(invokeai_url, batch_id)
     if not result["success"]:
@@ -454,7 +465,7 @@ def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_ke
         return False
     log(f"  Image generation complete")
 
-    # Step 4: Download the generated image from InvokeAI
+    # Step 3: Download the generated image from InvokeAI
     try:
         image_name = get_latest_image_name(invokeai_url)
         if not image_name:
@@ -466,7 +477,7 @@ def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_ke
         log(f"  Failed to download image: {e}", "error")
         return False
 
-    # Step 5: Create thumbnail and upload poster to the media-generator API
+    # Step 4: Create thumbnail and upload poster to the media-generator API
     try:
         log(f"  Creating thumbnail...")
         thumbnail_data = create_thumbnail(image_data)
@@ -479,37 +490,158 @@ def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_ke
         return False
 
 
-def main():
-    load_dotenv()
+def process_queue_item(queue_item, api_url, invokeai_url, templates_base, api_key, graph, seed_id, prompt_id, verbose=False):
+    """Generate and upload a poster for a queue item (combined prompt+image flow)."""
+    image_prompt = generate_prompt_for_item(queue_item, templates_base, verbose)
+    if image_prompt is None:
+        return False
 
-    parser = argparse.ArgumentParser(
-        description="Batch generate movie posters for movies missing them."
-    )
-    parser.add_argument(
-        "--media-api", default=DEFAULT_MEDIA_API_URL,
-        help=f"Media generator API URL (default: {DEFAULT_MEDIA_API_URL})"
-    )
-    parser.add_argument(
-        "--invokeai", default=DEFAULT_INVOKEAI_URL,
-        help=f"InvokeAI API URL (default: {DEFAULT_INVOKEAI_URL})"
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Enable verbose output"
-    )
-    parser.add_argument(
-        "--api-key", default=None,
-        help="API key for the media-generator API (default: from API_KEY env var)"
-    )
-    args = parser.parse_args()
+    prompt_item = {
+        "queue_id": queue_item["queue_id"],
+        "movie_id": queue_item["movie"]["movie_id"],
+        "title": queue_item["movie"]["title"],
+        "image_prompt": image_prompt,
+    }
+    return generate_image_for_item(prompt_item, api_url, invokeai_url, api_key, graph, seed_id, prompt_id)
 
-    api_key = args.api_key or os.getenv("API_KEY", "")
-    if not api_key:
-        log("No API key provided. Set API_KEY in .env or pass --api-key", "error")
+
+def run_prompts_phase(args, api_key, templates_base):
+    """Phase 1: Pop queue items and generate image prompts, saving to a JSON file."""
+    prompts_file = args.prompts_file
+
+    print(f"\n=== Batch Poster Generator (Prompts Phase) ===")
+    print(f"  Media API:     {args.media_api}")
+    print(f"  Prompts file:  {prompts_file}")
+    print()
+
+    # Backfill the poster queue
+    log("Backfilling poster queue...")
+    try:
+        backfill_result = backfill_queue(args.media_api, api_key)
+        log(f"Queue backfill: {backfill_result.get('added', 0)} added, "
+            f"{backfill_result.get('already_queued', 0)} already queued", "success")
+    except Exception as e:
+        log(f"Failed to backfill queue: {e}", "error")
         return 1
 
-    templates_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+    print()
 
+    prompt_items = []
+    fail_count = 0
+
+    # Pop items and generate prompts
+    while True:
+        try:
+            queue_item = pop_queue_item(args.media_api, api_key)
+        except Exception as e:
+            log(f"Failed to pop from queue: {e}", "error")
+            break
+
+        if queue_item is None:
+            log("Queue empty, no more items to process.")
+            break
+
+        image_prompt = generate_prompt_for_item(queue_item, templates_base, args.verbose)
+        if image_prompt is not None:
+            prompt_items.append({
+                "queue_id": queue_item["queue_id"],
+                "movie_id": queue_item["movie"]["movie_id"],
+                "title": queue_item["movie"]["title"],
+                "image_prompt": image_prompt,
+            })
+        else:
+            queue_id = queue_item["queue_id"]
+            try:
+                fail_queue_item(args.media_api, queue_id, api_key)
+            except Exception:
+                pass
+            fail_count += 1
+        print()
+
+    # Save prompts to JSON file
+    os.makedirs(os.path.dirname(prompts_file), exist_ok=True)
+    with open(prompts_file, "w") as f:
+        json.dump(prompt_items, f, indent=2)
+
+    print(f"=== Prompts phase complete: {len(prompt_items)} prompts saved, {fail_count} failed ===")
+    print(f"  Saved to: {prompts_file}\n")
+    return 0 if fail_count == 0 else 1
+
+
+def run_images_phase(args, api_key):
+    """Phase 2: Read prompts from JSON file, generate images with InvokeAI, upload."""
+    prompts_file = args.prompts_file
+
+    print(f"\n=== Batch Poster Generator (Images Phase) ===")
+    print(f"  Media API:     {args.media_api}")
+    print(f"  InvokeAI:      {args.invokeai}")
+    print(f"  Prompts file:  {prompts_file}")
+    print()
+
+    # Load prompts
+    if not os.path.exists(prompts_file):
+        log(f"Prompts file not found: {prompts_file}", "error")
+        return 1
+
+    with open(prompts_file) as f:
+        prompt_items = json.load(f)
+
+    if not prompt_items:
+        log("No prompts to process.")
+        return 0
+
+    log(f"Loaded {len(prompt_items)} prompts from {prompts_file}")
+
+    # Look up model keys from InvokeAI
+    log("Looking up models from InvokeAI...")
+    try:
+        models = lookup_invokeai_models(args.invokeai)
+        graph, seed_id, prompt_id = build_invokeai_graph(models)
+        log(f"Models found: {', '.join(m['name'] for m in models.values())}", "success")
+    except Exception as e:
+        log(f"Failed to look up models from InvokeAI: {e}", "error")
+        return 1
+
+    print()
+
+    success_count = 0
+    fail_count = 0
+
+    for prompt_item in prompt_items:
+        queue_id = prompt_item["queue_id"]
+        try:
+            if generate_image_for_item(
+                prompt_item, args.media_api, args.invokeai, api_key,
+                graph, seed_id, prompt_id
+            ):
+                complete_queue_item(args.media_api, queue_id, api_key)
+                success_count += 1
+            else:
+                fail_queue_item(args.media_api, queue_id, api_key)
+                fail_count += 1
+        except Exception as e:
+            log(f"Unexpected error processing queue item {queue_id}: {e}", "error")
+            try:
+                fail_queue_item(args.media_api, queue_id, api_key)
+            except Exception:
+                pass
+            fail_count += 1
+        print()
+
+    # Clean up prompts file after successful processing
+    if fail_count == 0:
+        try:
+            os.remove(prompts_file)
+            log(f"Cleaned up prompts file: {prompts_file}")
+        except OSError:
+            pass
+
+    print(f"=== Images phase complete: {success_count} succeeded, {fail_count} failed ===\n")
+    return 0 if fail_count == 0 else 1
+
+
+def run_all_phase(args, api_key, templates_base):
+    """Combined phase: generate prompts and images in one pass (original behavior)."""
     print(f"\n=== Batch Poster Generator ===")
     print(f"  Media API: {args.media_api}")
     print(f"  InvokeAI:  {args.invokeai}")
@@ -574,6 +706,54 @@ def main():
 
     print(f"=== Complete: {success_count} succeeded, {fail_count} failed ===\n")
     return 0 if fail_count == 0 else 1
+
+
+def main():
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(
+        description="Batch generate movie posters for movies missing them."
+    )
+    parser.add_argument(
+        "--phase", choices=["all", "prompts", "images"], default="all",
+        help="Which phase to run: 'prompts' generates image prompts and saves to file, "
+             "'images' reads prompts and generates images, 'all' does both (default: all)"
+    )
+    parser.add_argument(
+        "--media-api", default=DEFAULT_MEDIA_API_URL,
+        help=f"Media generator API URL (default: {DEFAULT_MEDIA_API_URL})"
+    )
+    parser.add_argument(
+        "--invokeai", default=DEFAULT_INVOKEAI_URL,
+        help=f"InvokeAI API URL (default: {DEFAULT_INVOKEAI_URL})"
+    )
+    parser.add_argument(
+        "--prompts-file", default=DEFAULT_PROMPTS_FILE,
+        help=f"Path to save/load prompts JSON file (default: {DEFAULT_PROMPTS_FILE})"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Enable verbose output"
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="API key for the media-generator API (default: from API_KEY env var)"
+    )
+    args = parser.parse_args()
+
+    api_key = args.api_key or os.getenv("API_KEY", "")
+    if not api_key:
+        log("No API key provided. Set API_KEY in .env or pass --api-key", "error")
+        return 1
+
+    templates_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+    if args.phase == "prompts":
+        return run_prompts_phase(args, api_key, templates_base)
+    elif args.phase == "images":
+        return run_images_phase(args, api_key)
+    else:
+        return run_all_phase(args, api_key, templates_base)
 
 
 if __name__ == "__main__":

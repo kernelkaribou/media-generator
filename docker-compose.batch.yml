@@ -1,10 +1,22 @@
-# Batch Poster Generation
+# Batch Poster Generation (GPU Time-Sharing)
 #
-# Run with:
-#   docker compose -f docker-compose.batch.yml up --build --abort-on-container-exit
+# Two-phase workflow for generating posters when the text model (vLLM)
+# and image model (InvokeAI) share the same GPU.
 #
-# The --abort-on-container-exit flag ensures all containers (including InvokeAI)
-# stop once the batch script finishes.
+# Use the orchestrator script:
+#   ./run-batch.sh
+#
+# Or run phases manually:
+#   # Phase 1: Generate prompts with vLLM
+#   docker compose -f docker-compose.batch.yml up batch-prompts --abort-on-container-exit
+#   docker compose -f docker-compose.batch.yml stop vllm
+#
+#   # Phase 2: Generate images with InvokeAI
+#   docker compose -f docker-compose.batch.yml up batch-images --abort-on-container-exit
+#   docker compose -f docker-compose.batch.yml down
+#
+# Or run the original combined flow (requires text model + InvokeAI on separate GPUs):
+#   docker compose -f docker-compose.batch.yml up batch-all --abort-on-container-exit
 
 networks:
   image-gen:
@@ -12,8 +24,43 @@ networks:
 
 volumes:
   invokeai:
+  batch-data:
 
 services:
+  # ── vLLM (GPU, text model for prompt generation) ──────────────────────
+  vllm:
+    container_name: batch-vllm
+    image: vllm/vllm-openai:latest
+    networks:
+      - image-gen
+    ports:
+      - "8001:8000"
+    environment:
+      - VLLM_API_KEY=${LOCAL_OPENAI_API_KEY:-no-key-required}
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      --quantization awq
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+      --max-num-seqs 1
+      --enforce-eager
+      --host 0.0.0.0
+      --port 8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    restart: "no"
+
+  # ── InvokeAI (GPU, image generation) ──────────────────────────────────
   invokeai:
     container_name: invokeai
     image: ghcr.io/invoke-ai/invokeai:latest
@@ -38,7 +85,61 @@ services:
       start_period: 60s
     restart: "no"
 
-  batch:
+  # ── Phase 1: Generate image prompts (needs vLLM) ──────────────────────
+  batch-prompts:
+    container_name: batch-poster-prompts
+    build:
+      context: .
+      dockerfile: Dockerfile.batch
+    networks:
+      - image-gen
+    environment:
+      - BATCH_PHASE=prompts
+      - MEDIA_API_URL=${MEDIA_API_URL:-https://movies.battlecabbage.com}
+      - API_KEY=${API_KEY}
+      - VERBOSE=${VERBOSE:-}
+      - PROMPTS_FILE=/data/batch-prompts.json
+      # AI model settings for prompt generation
+      - MODEL_TYPE=${MODEL_TYPE:-local_openai}
+      - LOCAL_OPENAI_ENDPOINT=http://vllm:8000/v1
+      - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-no-key-required}
+      - LOCAL_OPENAI_TEXT_MODEL=${VLLM_MODEL:-Qwen/Qwen3-8B-AWQ}
+      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME}
+      - AZURE_OPENAI_TEXT_ENDPOINT_KEY=${AZURE_OPENAI_TEXT_ENDPOINT_KEY}
+      - AZURE_OPENAI_TEXT_ENDPOINT=${AZURE_OPENAI_TEXT_ENDPOINT}
+      - AZURE_OPENAI_TEXT_DEPLOYMENT_NAME=${AZURE_OPENAI_TEXT_DEPLOYMENT_NAME}
+      - AZURE_OPENAI_TEXT_API_VERSION=${AZURE_OPENAI_TEXT_API_VERSION}
+    volumes:
+      - batch-data:/data
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Phase 2: Generate images from prompts (needs InvokeAI) ────────────
+  batch-images:
+    container_name: batch-poster-images
+    build:
+      context: .
+      dockerfile: Dockerfile.batch
+    networks:
+      - image-gen
+    environment:
+      - BATCH_PHASE=images
+      - INVOKEAI_URL=http://invokeai:9090
+      - MEDIA_API_URL=${MEDIA_API_URL:-https://movies.battlecabbage.com}
+      - API_KEY=${API_KEY}
+      - VERBOSE=${VERBOSE:-}
+      - PROMPTS_FILE=/data/batch-prompts.json
+    volumes:
+      - batch-data:/data
+    depends_on:
+      invokeai:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Combined: Original single-pass flow ───────────────────────────────
+  batch-all:
     container_name: batch-poster-gen
     build:
       context: .
@@ -46,17 +147,21 @@ services:
     networks:
       - image-gen
     environment:
+      - BATCH_PHASE=all
       - INVOKEAI_URL=http://invokeai:9090
       - MEDIA_API_URL=${MEDIA_API_URL:-https://movies.battlecabbage.com}
       - API_KEY=${API_KEY}
       - VERBOSE=${VERBOSE:-}
       # AI model settings for prompt generation
       - MODEL_TYPE=${MODEL_TYPE:-azure_openai}
+      - LOCAL_OPENAI_ENDPOINT=${LOCAL_OPENAI_ENDPOINT}
+      - LOCAL_OPENAI_API_KEY=${LOCAL_OPENAI_API_KEY:-no-key-required}
+      - LOCAL_OPENAI_TEXT_MODEL=${LOCAL_OPENAI_TEXT_MODEL}
+      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME}
       - AZURE_OPENAI_TEXT_ENDPOINT_KEY=${AZURE_OPENAI_TEXT_ENDPOINT_KEY}
       - AZURE_OPENAI_TEXT_ENDPOINT=${AZURE_OPENAI_TEXT_ENDPOINT}
       - AZURE_OPENAI_TEXT_DEPLOYMENT_NAME=${AZURE_OPENAI_TEXT_DEPLOYMENT_NAME}
       - AZURE_OPENAI_TEXT_API_VERSION=${AZURE_OPENAI_TEXT_API_VERSION}
-      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME}
     depends_on:
       invokeai:
         condition: service_healthy
